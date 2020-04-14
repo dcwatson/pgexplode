@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import functools
 
 import asyncpg
 
@@ -8,7 +9,9 @@ __version__ = ".".join(str(i) for i in __version_info__)
 
 
 TABLE_SQL = """
-    SELECT t.table_name, array_agg(kcu.column_name) AS pk_cols
+    SELECT
+        t.table_name,
+        array_agg(ARRAY[kcu.column_name, pg_get_serial_sequence(t.table_name, kcu.column_name)]) AS pks
     FROM information_schema.tables t
     JOIN information_schema.table_constraints tc
         ON tc.table_schema = t.table_schema
@@ -47,35 +50,72 @@ FK_SQL = """
 """
 
 
-async def copy_table(db, table, schema, select):
+def quote_name(name):
+    if name.startswith('"') and name.endswith('"'):
+        return name
+    return '"{}"'.format(name)
+
+
+async def maybe_execute(db, log, execute, query, *args, **kwargs):
+    result = "0"
+    if log:
+        print(query + ";")
+    if execute:
+        result = await db.execute(query, *args, **kwargs)
+    return result
+
+
+async def copy_table(executor, table, schema, select):
     """
     Creates a copy of the table in the new schema, and copies any related data into it.
     """
-    await db.execute(
-        "CREATE TABLE {schema}.{table} (LIKE public.{table} INCLUDING ALL)".format(table=table, schema=schema)
+    await executor(
+        "CREATE TABLE {schema}.{table} (LIKE public.{table} INCLUDING ALL)".format(
+            schema=quote_name(schema), table=table
+        )
     )
-    status = await db.execute(
-        "INSERT INTO {schema}.{table} ({select})".format(table=table, schema=schema, select=select)
+    status = await executor(
+        "INSERT INTO {schema}.{table} ({select})".format(schema=quote_name(schema), table=table, select=select)
     )
     return int(status.split()[-1])
 
 
-async def restore_keys(db, schema):
+async def restore_keys(executor, schema, graph):
     """
     Since CREATE TABLE LIKE does not copy foreign key constraints, we have to add them back manually.
     """
-    for row in await db.fetch(FK_SQL):
-        await db.execute(
-            "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({})".format(
-                schema,
-                row["table_name"],
-                row["constraint_name"],
-                row["column_name"],
-                schema,
-                row["foreign_table_name"],
-                row["foreign_column_name"],
+    for table, info in graph.items():
+        for parent, columns in info["fks"].items():
+            if parent == table:
+                continue
+            for from_col, to_col, nullable, constraint_name in columns:
+                await executor(
+                    "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({})".format(
+                        quote_name(schema), table, constraint_name, from_col, quote_name(schema), parent, to_col,
+                    )
+                )
+
+
+async def create_sequences(executor, schema, graph):
+    """
+    CREATE TABLE LIKE inherits the default sequences from the source table. This creates new ones.
+    """
+    for table, info in graph.items():
+        for col, seq in info["pks"].items():
+            if not seq:
+                continue
+            original_schema, name = seq.split(".")
+            await executor("CREATE SEQUENCE {schema}.{name}".format(schema=quote_name(schema), name=name))
+            await executor(
+                "ALTER SEQUENCE {schema}.{name} OWNED BY {schema}.{table}.{col}".format(
+                    schema=quote_name(schema), name=name, table=table, col=col
+                )
             )
-        )
+            await executor(
+                "ALTER TABLE {schema}.{table} ALTER {col} SET DEFAULT nextval('{raw_schema}.{name}'::regclass)".format(
+                    schema=quote_name(schema), name=name, table=table, col=col, raw_schema=schema
+                )
+            )
 
 
 async def build_graph(db, skip=None):
@@ -86,12 +126,12 @@ async def build_graph(db, skip=None):
     for row in await db.fetch(TABLE_SQL):
         if skip and row["table_name"] in skip:
             continue
-        graph[row["table_name"]] = {"pks": row["pk_cols"], "fks": {}}
+        graph[row["table_name"]] = {"pks": {a[0]: a[1] for a in row["pks"]}, "fks": {}}
     for row in await db.fetch(FK_SQL):
         if skip and (row["table_name"] in skip or row["foreign_table_name"] in skip):
             continue
         graph[row["table_name"]]["fks"].setdefault(row["foreign_table_name"], []).append(
-            (row["column_name"], row["foreign_column_name"], row["nullable"])
+            (row["column_name"], row["foreign_column_name"], row["nullable"], row["constraint_name"])
         )
     return graph
 
@@ -108,7 +148,7 @@ def find_joins(table, root, graph, path=None):
     for parent, columns in graph[table]["fks"].items():
         if parent == table:
             continue
-        for from_col, to_col, nullable in columns:
+        for from_col, to_col, nullable, constraint_name in columns:
             if not nullable:
                 found = find_joins(parent, root, graph, path + [(parent, from_col, to_col)])
                 if found:
@@ -117,7 +157,7 @@ def find_joins(table, root, graph, path=None):
     return candidates[0] if candidates else None
 
 
-async def table_data(db, graph, root, root_id):
+async def table_data(graph, root, root_id):
     """
     Yields each table along with a SELECT statement of the data that should be copied for that table, based on how it
     relates to the root table (and the root_id record specifically).
@@ -132,7 +172,7 @@ async def table_data(db, graph, root, root_id):
                 # and data would have already been copied. Not sure this is necessary anymore, since FK constraints
                 # are not copied as part of CREATE TABLE LIKE.
                 seen.add(child)
-                pk = info["pks"][0]
+                pk = list(info["pks"].keys())[0]
                 joins = find_joins(child, root, graph)
                 if joins:
                     parts = ["SELECT {}.* FROM {}".format(child, child)]
@@ -156,9 +196,9 @@ async def explode(opts):
     db = await asyncpg.connect(database=opts.dbname)
 
     graph = await build_graph(db)
-    pk = graph[opts.table]["pks"][0]
+    pk = list(graph[opts.table]["pks"].keys())[0]
 
-    if graph[opts.table]["fks"]:
+    if graph[opts.table]["fks"] and not opts.quiet and not opts.sql:
         print("Warning: Root table has FK links!")
 
     where = ""
@@ -168,20 +208,32 @@ async def explode(opts):
         where = " WHERE {} IN ({})".format(pk, in_clause)
         params = [int(i) if i.isdigit() else i for i in opts.ids]
 
+    executor = functools.partial(maybe_execute, db, opts.sql, not opts.dry)
+
     for row in await db.fetch("SELECT * FROM {}{}".format(opts.table, where), *params):
         schema = row[opts.schema] if opts.schema else "{}_{}".format(opts.table, row[pk])
 
-        await db.execute("DROP SCHEMA IF EXISTS {} CASCADE".format(schema))
-        await db.execute("CREATE SCHEMA {}".format(schema))
-        print("+", schema, flush=True)
+        if not opts.quiet:
+            if opts.sql:
+                print("--", schema, flush=True)
+            else:
+                print("+", schema, flush=True)
 
-        async for table, select in table_data(db, graph, opts.table, row[pk]):
-            print("  ~", table, end=": ", flush=True)
-            num = await copy_table(db, table, schema, select)
-            print(num, flush=True)
+        await executor("DROP SCHEMA IF EXISTS {} CASCADE".format(quote_name(schema)))
+        await executor("CREATE SCHEMA {}".format(quote_name(schema)))
 
-        # TODO: create id sequences, update pk defaults
-        await restore_keys(db, schema)
+        async for table, select in table_data(graph, opts.table, row[pk]):
+            if not opts.quiet and not opts.sql:
+                print("  ~", table, end=": ", flush=True)
+            num = await copy_table(executor, table, schema, select)
+            if not opts.quiet and not opts.sql:
+                print(num, flush=True)
+
+        await create_sequences(executor, schema, graph)
+        await restore_keys(executor, schema, graph)
+
+        if opts.sql and not opts.quiet:
+            print(flush=True)
 
     await db.close()
 
@@ -194,4 +246,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--table", required=True, help="The table to explode schemas based on")
     parser.add_argument("-s", "--schema", help="Column of the base table to use for schema names")
     parser.add_argument("-i", "--id", action="append", dest="ids", metavar="ROW_ID", help="Specific row(s) to explode")
+    parser.add_argument("-q", "--quiet", action="store_true", default=False, help="Run without any output")
+    parser.add_argument("-n", "--dry-run", action="store_true", dest="dry", default=False, help="Dry run")
+    parser.add_argument("--sql", action="store_true", default=False, help="Print the SQL that is or would be run")
     asyncio.run(explode(parser.parse_args()))
