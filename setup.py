@@ -17,6 +17,8 @@ setup(
     project_urls={"Documentation": "https://dcwatson.github.io/pgexplode/"},
     license="MIT",
     py_modules=["pgexplode"],
+    install_requires=["asyncpg"],
+    entry_points={"console_scripts": ["pgexplode=pgexplode:main"]},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

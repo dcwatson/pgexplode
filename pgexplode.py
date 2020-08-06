@@ -2,8 +2,6 @@ import argparse
 import asyncio
 import functools
 
-import asyncpg
-
 __version_info__ = (0, 1, 0)
 __version__ = ".".join(str(i) for i in __version_info__)
 
@@ -80,7 +78,7 @@ async def copy_table(executor, table, schema, select):
     return int(status.split()[-1])
 
 
-async def restore_keys(executor, schema, graph):
+async def restore_keys(executor, schema, graph, exclude):
     """
     Since CREATE TABLE LIKE does not copy foreign key constraints, we have to add them back manually.
     """
@@ -89,18 +87,27 @@ async def restore_keys(executor, schema, graph):
             if parent == table:
                 continue
             for from_col, to_col, nullable, constraint_name in columns:
+                parent_schema = "public" if parent in exclude else schema
                 await executor(
                     "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({})".format(
-                        quote_name(schema), table, constraint_name, from_col, quote_name(schema), parent, to_col,
+                        quote_name(schema),
+                        table,
+                        constraint_name,
+                        from_col,
+                        quote_name(parent_schema),
+                        parent,
+                        to_col,
                     )
                 )
 
 
-async def create_sequences(executor, schema, graph):
+async def create_sequences(executor, schema, graph, exclude):
     """
     CREATE TABLE LIKE inherits the default sequences from the source table. This creates new ones.
     """
     for table, info in graph.items():
+        if table in exclude:
+            continue
         for col, seq in info["pks"].items():
             if not seq:
                 continue
@@ -185,14 +192,17 @@ async def table_data(graph, root, root_id):
                         )
                         last = parent
                     parts.append("WHERE {}.{} = {}".format(root, pk, root_id))
-                    yield child, " ".join(parts)
+                    yield child, " ".join(parts), True
                 elif child == root:
-                    yield child, "SELECT * FROM {} WHERE {} = {}".format(root, pk, root_id)
+                    yield child, "SELECT * FROM {} WHERE {} = {}".format(root, pk, root_id), True
                 else:
-                    yield child, "SELECT * FROM {}".format(child)
+                    yield child, "SELECT * FROM {}".format(child), False
 
 
 async def explode(opts):
+    # Import lazily to avoid dependency issues when just checking version.
+    import asyncpg
+
     db = await asyncpg.connect(database=opts.dbname)
 
     graph = await build_graph(db)
@@ -222,15 +232,22 @@ async def explode(opts):
         await executor("DROP SCHEMA IF EXISTS {} CASCADE".format(quote_name(schema)))
         await executor("CREATE SCHEMA {}".format(quote_name(schema)))
 
-        async for table, select in table_data(graph, opts.table, row[pk]):
+        async for table, select, related in table_data(graph, opts.table, row[pk]):
             if not opts.quiet and not opts.sql:
                 print("  ~", table, end=": ", flush=True)
-            num = await copy_table(executor, table, schema, select)
-            if not opts.quiet and not opts.sql:
-                print(num, flush=True)
+            if table in opts.exclude:
+                if not opts.quiet and not opts.sql:
+                    print("EXCLUDED", flush=True)
+            elif opts.minimal and not related:
+                if not opts.quiet and not opts.sql:
+                    print("SKIPPED", flush=True)
+            else:
+                num = await copy_table(executor, table, schema, select)
+                if not opts.quiet and not opts.sql:
+                    print(num, flush=True)
 
-        await create_sequences(executor, schema, graph)
-        await restore_keys(executor, schema, graph)
+        await create_sequences(executor, schema, graph, opts.exclude)
+        await restore_keys(executor, schema, graph, opts.exclude)
 
         if opts.sql and not opts.quiet:
             print(flush=True)
@@ -238,7 +255,7 @@ async def explode(opts):
     await db.close()
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Explode a PostgreSQL table (and any related data) into separate schemas."
     )
@@ -246,7 +263,13 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--table", required=True, help="The table to explode schemas based on")
     parser.add_argument("-s", "--schema", help="Column of the base table to use for schema names")
     parser.add_argument("-i", "--id", action="append", dest="ids", metavar="ROW_ID", help="Specific row(s) to explode")
+    parser.add_argument("-m", "--minimal", action="store_true", default=False, help="Only copy referenced tables")
     parser.add_argument("-q", "--quiet", action="store_true", default=False, help="Run without any output")
     parser.add_argument("-n", "--dry-run", action="store_true", dest="dry", default=False, help="Dry run")
     parser.add_argument("--sql", action="store_true", default=False, help="Print the SQL that is or would be run")
+    parser.add_argument("-x", "--exclude", action="append", metavar="TABLE", help="Exclude tables from explosion")
     asyncio.run(explode(parser.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
